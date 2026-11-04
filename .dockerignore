@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+__pycache__
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+tests
+README.md
+timber-data
+node_modules
+frontend/dist
