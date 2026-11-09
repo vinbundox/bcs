@@ -59,6 +59,16 @@ class TimberTrackTests(unittest.TestCase):
         self.assertTrue(verify_password("correct horse battery", stored))
         self.assertFalse(verify_password("wrong password", stored))
 
+    def test_root_and_health_routes_respond_for_host_health_checks(self):
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        if response.headers["content-type"].startswith("application/json"):
+            self.assertEqual(response.json()["name"], "TimberTrack API")
+        else:
+            self.assertIn("TimberTrack", response.text)
+        self.assertEqual(self.client.head("/").status_code, 200)
+        self.assertEqual(self.client.get("/healthz").status_code, 200)
+
     def test_jwt_auth_stock_traceability_reports_and_rbac(self):
         self.assertEqual(self.client.get("/api/v1/suppliers").status_code, 401)
         self.assertEqual(self.client.post("/api/v1/auth/setup", json={
@@ -106,6 +116,8 @@ class TimberTrackTests(unittest.TestCase):
             "lot_id": lot_id, "customer": "Customer", "volume_m3": 2, "price_per_m3": 1800,
         }, headers=self.headers())
         self.assertEqual(sale.status_code, 201, sale.text)
+        sale_id = sale.json()["id"]
+        self.assertEqual(self.client.get("/api/v1/sales").json()[0]["id"], sale_id)
         over_sale = self.client.post("/api/v1/sales", json={
             "lot_id": lot_id, "customer": "Customer", "volume_m3": 4, "price_per_m3": 1800,
         }, headers=self.headers())
@@ -115,6 +127,11 @@ class TimberTrackTests(unittest.TestCase):
         self.assertEqual(reports["summary"]["stock_m3"], 3)
         self.assertEqual(reports["summary"]["sold_m3"], 2)
         self.assertEqual(reports["financial"]["sales_kes"], 3600)
+        self.assertEqual(reports["financial"]["inventory_value_kes"], 3000)
+        self.assertEqual(reports["financial"]["profit_and_loss"]["gross_profit_kes"], 1600)
+        self.assertEqual(reports["financial"]["by_species"][0]["average_purchase_rate_kes_per_m3"], 1000)
+        self.assertEqual(reports["financial"]["by_lot"][0]["available_m3"], 3)
+        self.assertEqual(reports["financial"]["by_lot"][0]["inventory_value_kes"], 3000)
         performance = self.client.get("/api/v1/reports/supplier-performance").json()
         self.assertEqual(performance[0]["purchased_m3"], 5)
         purchases = self.client.get("/api/v1/reports/purchases-vs-sales?from=2026-01-01&to=2027-01-01").json()
@@ -127,6 +144,37 @@ class TimberTrackTests(unittest.TestCase):
         self.assertEqual(trace["lot"]["dimensions"], "50x100mm")
         history = self.client.get(f"/api/v1/lots/{lot_id}/history").json()
         self.assertEqual([entry["kind"] for entry in history], ["received", "reserve", "unreserve", "sold"])
+
+        purchase_edit = self.client.put(f"/api/v1/lots/{lot_id}/purchase", json={
+            "lot_code": "LOT-1", "supplier_id": supplier.json()["id"], "species": "Cypress",
+            "grade": "B", "cost_per_m3": 1200, "location": "Bay A2",
+            "origin_document": "DOC-2", "dimensions": "50x100mm", "pieces": 20,
+        }, headers=self.headers())
+        self.assertEqual(purchase_edit.status_code, 200, purchase_edit.text)
+        edited_lot = self.client.get("/api/v1/lots").json()[0]
+        self.assertEqual(edited_lot["cost_per_m3"], 1200)
+        self.assertEqual(edited_lot["grade"], "B")
+        self.assertEqual(self.client.get(f"/api/v1/lots/{lot_id}/history").json()[-1]["kind"], "purchase_edited")
+
+        sale_edit = self.client.put(f"/api/v1/sales/{sale_id}", json={
+            "customer": "Updated Customer", "volume_m3": 2.5, "price_per_m3": 1900,
+        }, headers=self.headers())
+        self.assertEqual(sale_edit.status_code, 200, sale_edit.text)
+        self.assertEqual(self.client.get("/api/v1/sales").json()[0]["customer"], "Updated Customer")
+        self.assertEqual(self.client.get("/api/v1/lots").json()[0]["remaining_m3"], 2.5)
+        rejected_sale_edit = self.client.put(f"/api/v1/sales/{sale_id}", json={
+            "customer": "Updated Customer", "volume_m3": 5.1, "price_per_m3": 1900,
+        }, headers=self.headers())
+        self.assertEqual(rejected_sale_edit.status_code, 409)
+        self.assertEqual(self.client.get("/api/v1/lots").json()[0]["remaining_m3"], 2.5)
+        edited_reports = self.client.get("/api/v1/reports").json()
+        self.assertEqual(edited_reports["financial"]["sales_kes"], 4750)
+        self.assertEqual(edited_reports["financial"]["estimated_cost_kes"], 3000)
+        self.assertEqual(edited_reports["financial"]["profit_and_loss"]["gross_profit_kes"], 1750)
+        self.assertEqual(self.client.get(f"/api/v1/lots/{lot_id}/history").json()[-1]["kind"], "sale_edited")
+        audit_rows = self.client.get("/api/v1/audit").json()
+        self.assertTrue(any(row["action"] == "edit_purchase" for row in audit_rows))
+        self.assertTrue(any(row["action"] == "edit_sale" for row in audit_rows))
 
         team = self.client.post("/api/v1/users", json={
             "username": "yardstaff", "password": "another long password", "role": "yard",
@@ -142,6 +190,14 @@ class TimberTrackTests(unittest.TestCase):
         yard_report = self.client.get("/api/v1/reports").json()
         self.assertNotIn("financial", yard_report)
         self.assertEqual(self.client.get("/api/v1/audit").status_code, 403)
+        self.assertEqual(self.client.put(f"/api/v1/lots/{lot_id}/purchase", json={
+            "lot_code": "LOT-1", "supplier_id": supplier.json()["id"], "species": "Cypress",
+            "grade": "B", "cost_per_m3": 1200, "location": "Bay A2",
+            "origin_document": "DOC-2", "dimensions": "50x100mm", "pieces": 20,
+        }, headers=self.headers()).status_code, 403)
+        self.assertEqual(self.client.put(f"/api/v1/sales/{sale_id}", json={
+            "customer": "Customer", "volume_m3": 1, "price_per_m3": 100,
+        }, headers=self.headers()).status_code, 403)
         self.assertEqual(self.client.post("/api/v1/sales", json={
             "lot_id": lot_id, "customer": "Customer", "volume_m3": 1, "price_per_m3": 100,
         }, headers=self.headers()).status_code, 403)

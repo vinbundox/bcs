@@ -1,4 +1,4 @@
-const CACHE = "timbertrack-shell-v2";
+const CACHE = "timbertrack-shell-v4";
 const APP_SHELL = ["/", "/style.css", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

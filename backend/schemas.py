@@ -74,6 +74,18 @@ class LotCreate(BaseModel):
     purchase_order_id: int | None = Field(default=None, gt=0)
 
 
+class LotPurchaseEdit(BaseModel):
+    lot_code: str = Field(min_length=1, max_length=100)
+    supplier_id: int = Field(gt=0)
+    species: str = Field(min_length=1, max_length=100)
+    grade: str = Field(default="", max_length=100)
+    cost_per_m3: float = Field(ge=0, allow_inf_nan=False)
+    location: str = Field(min_length=1, max_length=200)
+    origin_document: str = Field(default="", max_length=200)
+    dimensions: str | None = Field(default=None, max_length=100)
+    pieces: int | None = Field(default=None, ge=1)
+
+
 class MoveRequest(BaseModel):
     location: str = Field(min_length=1, max_length=200)
 
@@ -86,6 +98,12 @@ class MovementCreate(BaseModel):
 
 class SaleCreate(BaseModel):
     lot_id: int = Field(gt=0)
+    customer: str = Field(min_length=1, max_length=200)
+    volume_m3: float = Field(gt=0, allow_inf_nan=False)
+    price_per_m3: float = Field(ge=0, allow_inf_nan=False)
+
+
+class SaleEdit(BaseModel):
     customer: str = Field(min_length=1, max_length=200)
     volume_m3: float = Field(gt=0, allow_inf_nan=False)
     price_per_m3: float = Field(ge=0, allow_inf_nan=False)

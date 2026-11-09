@@ -1,22 +1,25 @@
 import hashlib
 import hmac
+import json
 import os
 import secrets
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from jose import JWTError, jwt
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.staticfiles import StaticFiles
 
 from backend.database import get_db
 from backend.models import AuditLog, Customer, Lot, Location, Movement, PurchaseOrder, Sale, SalesOrder, Supplier, User
 from backend.schemas import (
     Credentials, CustomerCreate, LocationCreate, LotCreate, MoveRequest, PurchaseOrderCreate,
-    MovementCreate, PurchaseOrderReceive, SaleCreate, SalesOrderCreate, SetupCredentials,
+    LotPurchaseEdit, MovementCreate, PurchaseOrderReceive, SaleCreate, SaleEdit, SalesOrderCreate, SetupCredentials,
     SupplierCreate, UserCreate, UserPatch,
 )
 
@@ -48,6 +51,22 @@ app = FastAPI(
     openapi_url="/api/v1/openapi.json",
     docs_url="/api/v1/docs",
 )
+FRONTEND_DIR = Path(os.environ.get(
+    "TIMBER_FRONTEND_DIR", str(Path(__file__).resolve().parents[1] / "frontend" / "dist")
+))
+
+
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+def frontend_root():
+    index = FRONTEND_DIR / "index.html"
+    if index.is_file():
+        return FileResponse(index)
+    return {
+        "name": "TimberTrack API",
+        "message": "The API is running. Build the React frontend to serve the app here.",
+        "docs": "/api/v1/docs",
+        "health": "/healthz",
+    }
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -266,6 +285,58 @@ def receive_lot(data: LotCreate, user: Annotated[User, Depends(require_permissio
     return {"id": lot.id}
 
 
+@app.put("/api/v1/lots/{lot_id}/purchase", tags=["lots"],
+         dependencies=[Depends(require_csrf)])
+def edit_lot_purchase(
+    lot_id: int,
+    data: LotPurchaseEdit,
+    user: Annotated[User, Depends(current_user)],
+    db: Db,
+):
+    if user.role != "owner":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the owner can edit purchase details.")
+    lot = db.get(Lot, lot_id)
+    if not lot:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lot not found.")
+    supplier = db.get(Supplier, data.supplier_id)
+    if not supplier:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Supplier not found.")
+
+    fields = (
+        "lot_code", "supplier_id", "species", "grade", "cost_per_m3",
+        "location", "origin_document", "dimensions", "pieces",
+    )
+    before = {field: getattr(lot, field) for field in fields}
+    after = data.model_dump()
+    after["lot_code"] = after["lot_code"].strip()
+    after["species"] = after["species"].strip()
+    after["grade"] = after["grade"].strip()
+    after["location"] = after["location"].strip()
+    after["origin_document"] = after["origin_document"].strip()
+    after["dimensions"] = after["dimensions"].strip() if after["dimensions"] else None
+    if not after["lot_code"] or not after["species"] or not after["location"]:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Lot code, species, and location are required.")
+    for field in fields:
+        setattr(lot, field, after[field])
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "That lot code is already in use.")
+    detail = json.dumps({"before": before, "after": after}, ensure_ascii=False, default=str)
+    db.add(Movement(
+        lot_id=lot.id,
+        kind="purchase_edited",
+        detail=f"Purchase details updated: {detail}",
+        volume_m3=lot.remaining_m3,
+        user_id=user.id,
+        created_at=timestamp(),
+    ))
+    audit(db, user, "edit_purchase", "lot", lot.id, detail)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/v1/lots/{lot_id}/history", tags=["lots"])
 def lot_history(lot_id: int, _user: Annotated[User, Depends(require_permission("lots.read"))], db: Db):
     lot = db.get(Lot, lot_id)
@@ -376,6 +447,72 @@ def create_sale(data: SaleCreate, user: Annotated[User, Depends(require_permissi
     return {"id": sale.id}
 
 
+@app.put("/api/v1/sales/{sale_id}", tags=["sales"],
+         dependencies=[Depends(require_csrf)])
+def edit_sale(
+    sale_id: int,
+    data: SaleEdit,
+    user: Annotated[User, Depends(current_user)],
+    db: Db,
+):
+    if user.role != "owner":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the owner can edit sales and invoices.")
+    sale = db.get(Sale, sale_id)
+    if not sale:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sale not found.")
+    customer = data.customer.strip()
+    if not customer:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Customer name is required.")
+    lot = db.get(Lot, sale.lot_id)
+    old_volume = float(sale.volume_m3)
+    new_volume = float(data.volume_m3)
+    volume_delta = new_volume - old_volume
+    if volume_delta > 0 and lot.status not in {"in_stock", "graded"}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Sale volume cannot be increased while its lot is reserved or delivered.",
+        )
+    if volume_delta:
+        stock_update = update(Lot).where(Lot.id == lot.id)
+        if volume_delta > 0:
+            stock_update = stock_update.where(Lot.remaining_m3 >= volume_delta)
+        stock_result = db.execute(
+            stock_update.values(
+                remaining_m3=Lot.remaining_m3 - volume_delta,
+                status="in_stock" if volume_delta < 0 and lot.status == "delivered" else Lot.status,
+            )
+        )
+        if not stock_result.rowcount:
+            db.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, "Sale volume exceeds available stock.")
+
+    before = {
+        "customer": sale.customer,
+        "volume_m3": old_volume,
+        "price_per_m3": float(sale.price_per_m3),
+    }
+    after = {
+        "customer": customer,
+        "volume_m3": new_volume,
+        "price_per_m3": float(data.price_per_m3),
+    }
+    sale.customer = after["customer"]
+    sale.volume_m3 = new_volume
+    sale.price_per_m3 = after["price_per_m3"]
+    detail = json.dumps({"before": before, "after": after}, ensure_ascii=False)
+    db.add(Movement(
+        lot_id=lot.id,
+        kind="sale_edited",
+        detail=f"Sale {sale.id} updated: {detail}",
+        volume_m3=abs(volume_delta),
+        user_id=user.id,
+        created_at=timestamp(),
+    ))
+    audit(db, user, "edit_sale", "sale", sale.id, detail)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/v1/users", tags=["users"])
 def list_users(_user: Annotated[User, Depends(require_permission("users.manage"))], db: Db):
     users = db.scalars(select(User).order_by(User.username)).all()
@@ -449,11 +586,58 @@ def reports(user: Annotated[User, Depends(require_permission("reports.read"))], 
     lots = db.scalars(select(Lot)).all()
     sales = db.scalars(select(Sale)).all()
     stock = {}
+    lot_financials = {}
+    species_financials = {}
     for lot in lots:
+        lot_entry = lot_financials.setdefault(lot.id, {
+            "lot_code": lot.lot_code,
+            "species": lot.species,
+            "available_m3": float(lot.remaining_m3),
+            "purchase_rate_kes_per_m3": float(lot.cost_per_m3),
+            "inventory_value_kes": float(lot.remaining_m3) * float(lot.cost_per_m3),
+            "sold_m3": 0.0,
+            "sales_revenue_kes": 0.0,
+            "cost_of_goods_sold_kes": 0.0,
+        })
+        species_entry = species_financials.setdefault(lot.species, {
+            "species": lot.species,
+            "available_m3": 0.0,
+            "inventory_value_kes": 0.0,
+            "sold_m3": 0.0,
+            "sales_revenue_kes": 0.0,
+            "cost_of_goods_sold_kes": 0.0,
+            "purchase_volume_m3": 0.0,
+            "purchase_value_kes": 0.0,
+        })
+        species_entry["available_m3"] += float(lot.remaining_m3)
+        species_entry["inventory_value_kes"] += float(lot.remaining_m3) * float(lot.cost_per_m3)
+        species_entry["purchase_volume_m3"] += float(lot.volume_m3)
+        species_entry["purchase_value_kes"] += float(lot.volume_m3) * float(lot.cost_per_m3)
         if lot.remaining_m3 > 0:
-            entry = stock.setdefault(lot.species, {"species": lot.species, "volume_m3": 0.0, "lots": 0})
+            entry = stock.setdefault(lot.species, {
+                "species": lot.species, "volume_m3": 0.0, "lots": 0,
+            })
             entry["volume_m3"] += lot.remaining_m3
             entry["lots"] += 1
+    for sale in sales:
+        revenue = float(sale.volume_m3) * float(sale.price_per_m3)
+        cost = float(sale.volume_m3) * float(sale.lot.cost_per_m3)
+        lot_entry = lot_financials[sale.lot_id]
+        lot_entry["sold_m3"] += float(sale.volume_m3)
+        lot_entry["sales_revenue_kes"] += revenue
+        lot_entry["cost_of_goods_sold_kes"] += cost
+        species_entry = species_financials[sale.lot.species]
+        species_entry["sold_m3"] += float(sale.volume_m3)
+        species_entry["sales_revenue_kes"] += revenue
+        species_entry["cost_of_goods_sold_kes"] += cost
+    for entry in species_financials.values():
+        entry["average_purchase_rate_kes_per_m3"] = (
+            entry["purchase_value_kes"] / entry["purchase_volume_m3"]
+            if entry["purchase_volume_m3"] else 0.0
+        )
+        entry["gross_profit_kes"] = entry["sales_revenue_kes"] - entry["cost_of_goods_sold_kes"]
+    for entry in lot_financials.values():
+        entry["gross_profit_kes"] = entry["sales_revenue_kes"] - entry["cost_of_goods_sold_kes"]
     result = {
         "summary": {
             "stock_m3": sum(lot.remaining_m3 for lot in lots),
@@ -463,9 +647,23 @@ def reports(user: Annotated[User, Depends(require_permission("reports.read"))], 
         "stock_by_species": sorted(stock.values(), key=lambda entry: entry["species"]),
     }
     if user.role in {"owner", "finance"}:
+        sales_revenue = sum(float(sale.volume_m3) * float(sale.price_per_m3) for sale in sales)
+        cost_of_goods_sold = sum(
+            float(sale.volume_m3) * float(sale.lot.cost_per_m3) for sale in sales
+        )
         result["financial"] = {
-            "sales_kes": sum(sale.volume_m3 * sale.price_per_m3 for sale in sales),
-            "estimated_cost_kes": sum(sale.volume_m3 * sale.lot.cost_per_m3 for sale in sales),
+            "sales_kes": sales_revenue,
+            "estimated_cost_kes": cost_of_goods_sold,
+            "inventory_value_kes": sum(
+                float(lot.remaining_m3) * float(lot.cost_per_m3) for lot in lots
+            ),
+            "profit_and_loss": {
+                "sales_revenue_kes": sales_revenue,
+                "cost_of_goods_sold_kes": cost_of_goods_sold,
+                "gross_profit_kes": sales_revenue - cost_of_goods_sold,
+            },
+            "by_species": sorted(species_financials.values(), key=lambda entry: entry["species"]),
+            "by_lot": sorted(lot_financials.values(), key=lambda entry: entry["lot_code"]),
         }
     return result
 
@@ -662,3 +860,7 @@ def create_sales_order(data: SalesOrderCreate,
     audit(db, user, "create", "sales_order", order.id, order.order_code)
     db.commit()
     return {"id": order.id}
+
+
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend-assets")
