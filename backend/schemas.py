@@ -1,9 +1,10 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 Role = Literal["owner", "sourcing", "yard", "sales", "finance", "viewer"]
+LotCategory = Literal["timber", "poles", "posts", "other"]
 
 
 class Credentials(BaseModel):
@@ -38,6 +39,7 @@ class PurchaseOrderCreate(BaseModel):
 
 class PurchaseOrderReceive(BaseModel):
     lot_code: str = Field(min_length=1, max_length=100)
+    category: LotCategory = "timber"
     species: str = Field(min_length=1, max_length=100)
     grade: str = Field(default="", max_length=100)
     volume_m3: float = Field(gt=0, allow_inf_nan=False)
@@ -46,6 +48,12 @@ class PurchaseOrderReceive(BaseModel):
     origin_document: str = Field(default="", max_length=200)
     dimensions: str | None = Field(default=None, max_length=100)
     pieces: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def require_whole_piece_quantity(self):
+        if self.category in {"poles", "posts"} and not self.volume_m3.is_integer():
+            raise ValueError("Pole and post quantities must be whole pieces.")
+        return self
 
 
 class SalesOrderCreate(BaseModel):
@@ -63,6 +71,7 @@ class UserPatch(BaseModel):
 class LotCreate(BaseModel):
     lot_code: str = Field(min_length=1, max_length=100)
     supplier_id: int = Field(gt=0)
+    category: LotCategory = "timber"
     species: str = Field(min_length=1, max_length=100)
     grade: str = Field(default="", max_length=100)
     volume_m3: float = Field(gt=0, allow_inf_nan=False)
@@ -73,10 +82,17 @@ class LotCreate(BaseModel):
     pieces: int | None = Field(default=None, ge=1)
     purchase_order_id: int | None = Field(default=None, gt=0)
 
+    @model_validator(mode="after")
+    def require_whole_piece_quantity(self):
+        if self.category in {"poles", "posts"} and not self.volume_m3.is_integer():
+            raise ValueError("Pole and post quantities must be whole pieces.")
+        return self
+
 
 class LotPurchaseEdit(BaseModel):
     lot_code: str = Field(min_length=1, max_length=100)
     supplier_id: int = Field(gt=0)
+    category: LotCategory = "timber"
     species: str = Field(min_length=1, max_length=100)
     grade: str = Field(default="", max_length=100)
     cost_per_m3: float = Field(ge=0, allow_inf_nan=False)

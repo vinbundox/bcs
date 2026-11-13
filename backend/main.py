@@ -16,7 +16,10 @@ from sqlalchemy.orm import Session
 from starlette.staticfiles import StaticFiles
 
 from backend.database import get_db
-from backend.models import AuditLog, Customer, Lot, Location, Movement, PurchaseOrder, Sale, SalesOrder, Supplier, User
+from backend.models import (
+    PIECE_CATEGORIES, AuditLog, Customer, Lot, Location, Movement, PurchaseOrder, Sale,
+    SalesOrder, Supplier, User,
+)
 from backend.schemas import (
     Credentials, CustomerCreate, LocationCreate, LotCreate, MoveRequest, PurchaseOrderCreate,
     LotPurchaseEdit, MovementCreate, PurchaseOrderReceive, SaleCreate, SaleEdit, SalesOrderCreate, SetupCredentials,
@@ -54,6 +57,7 @@ app = FastAPI(
 FRONTEND_DIR = Path(os.environ.get(
     "TIMBER_FRONTEND_DIR", str(Path(__file__).resolve().parents[1] / "frontend" / "dist")
 ))
+LOT_CATEGORIES = ("timber", "poles", "posts", "other")
 
 
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
@@ -67,6 +71,10 @@ def frontend_root():
         "docs": "/api/v1/docs",
         "health": "/healthz",
     }
+
+
+def unit_for_category(category: str) -> str:
+    return "pcs" if category in PIECE_CATEGORIES else "m3"
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -243,9 +251,12 @@ def create_supplier(data: SupplierCreate, user: Annotated[User, Depends(require_
 def serialize_lot(lot: Lot, include_cost: bool):
     remaining = float(lot.remaining_m3)
     status_label = "Sold" if remaining == 0 else "Partially sold" if remaining < float(lot.volume_m3) else "In stock"
+    unit = "pcs" if lot.category in PIECE_CATEGORIES else "m3"
     result = {
         "id": lot.id, "lot_code": lot.lot_code, "supplier_id": lot.supplier_id,
-        "supplier_name": lot.supplier.name, "species": lot.species, "grade": lot.grade,
+        "supplier_name": lot.supplier.name, "category": lot.category, "unit": unit,
+        "quantity": float(lot.volume_m3), "remaining_quantity": remaining,
+        "species": lot.species, "grade": lot.grade,
         "volume_m3": float(lot.volume_m3), "remaining_m3": remaining, "location": lot.location,
         "origin_document": lot.origin_document, "created_at": lot.created_at, "status": status_label,
         "dimensions": lot.dimensions, "pieces": lot.pieces, "lot_status": lot.status,
@@ -253,6 +264,7 @@ def serialize_lot(lot: Lot, include_cost: bool):
     }
     if include_cost:
         result["cost_per_m3"] = float(lot.cost_per_m3)
+        result["buying_rate"] = float(lot.cost_per_m3)
     return result
 
 
@@ -280,7 +292,7 @@ def receive_lot(data: LotCreate, user: Annotated[User, Depends(require_permissio
     if lot.purchase_order_id:
         order = db.get(PurchaseOrder, lot.purchase_order_id)
         order.status = "received"
-    audit(db, user, "receive", "lot", lot.id, f"{lot.lot_code}: {lot.volume_m3} m3")
+    audit(db, user, "receive", "lot", lot.id, f"{lot.lot_code}: {lot.volume_m3} {unit_for_category(lot.category)}")
     db.commit()
     return {"id": lot.id}
 
@@ -302,8 +314,13 @@ def edit_lot_purchase(
     if not supplier:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Supplier not found.")
 
+    if data.category != lot.category:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "A lot's category cannot be changed after receipt because its stock unit is category-specific.",
+        )
     fields = (
-        "lot_code", "supplier_id", "species", "grade", "cost_per_m3",
+        "lot_code", "supplier_id", "category", "species", "grade", "cost_per_m3",
         "location", "origin_document", "dimensions", "pieces",
     )
     before = {field: getattr(lot, field) for field in fields}
@@ -412,7 +429,10 @@ def create_movement(lot_id: int, data: MovementCreate,
 def list_sales(_user: Annotated[User, Depends(require_permission("sales.read"))], db: Db):
     sales = db.scalars(select(Sale).order_by(Sale.created_at.desc()).limit(100)).all()
     return [{
-        "id": sale.id, "customer": sale.customer, "volume_m3": sale.volume_m3,
+        "id": sale.id, "customer": sale.customer, "category": sale.lot.category,
+        "unit": unit_for_category(sale.lot.category),
+        "quantity": float(sale.volume_m3), "unit_price": float(sale.price_per_m3),
+        "volume_m3": sale.volume_m3,
         "price_per_m3": sale.price_per_m3, "created_at": sale.created_at,
         "lot_code": sale.lot.lot_code, "species": sale.lot.species, "recorded_by": sale.user.username,
     } for sale in sales]
@@ -424,6 +444,8 @@ def create_sale(data: SaleCreate, user: Annotated[User, Depends(require_permissi
     lot = db.get(Lot, data.lot_id)
     if not lot:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lot not found.")
+    if lot.category in PIECE_CATEGORIES and not float(data.volume_m3).is_integer():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Pole and post sale quantities must be whole pieces.")
     if data.volume_m3 > lot.remaining_m3:
         raise HTTPException(status.HTTP_409_CONFLICT, "Sale volume exceeds available stock.")
     if lot.status == "reserved":
@@ -466,6 +488,8 @@ def edit_sale(
     lot = db.get(Lot, sale.lot_id)
     old_volume = float(sale.volume_m3)
     new_volume = float(data.volume_m3)
+    if lot.category in PIECE_CATEGORIES and not new_volume.is_integer():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Pole and post sale quantities must be whole pieces.")
     volume_delta = new_volume - old_volume
     if volume_delta > 0 and lot.status not in {"in_stock", "graded"}:
         raise HTTPException(
@@ -588,63 +612,108 @@ def reports(user: Annotated[User, Depends(require_permission("reports.read"))], 
     stock = {}
     lot_financials = {}
     species_financials = {}
+    category_totals = {
+        category: {
+            "category": category,
+            "unit": unit_for_category(category),
+            "available_quantity": 0.0,
+            "sold_quantity": 0.0,
+            "lots": 0,
+        }
+        for category in LOT_CATEGORIES
+    }
     for lot in lots:
+        category = lot.category if lot.category in LOT_CATEGORIES else "other"
+        unit = unit_for_category(category)
+        amount = float(lot.volume_m3)
+        remaining = float(lot.remaining_m3)
         lot_entry = lot_financials.setdefault(lot.id, {
             "lot_code": lot.lot_code,
+            "category": category,
+            "unit": unit,
             "species": lot.species,
-            "available_m3": float(lot.remaining_m3),
-            "purchase_rate_kes_per_m3": float(lot.cost_per_m3),
+            "available_quantity": remaining,
+            "available_m3": remaining if unit == "m3" else 0.0,
+            "purchase_rate": float(lot.cost_per_m3),
+            "purchase_rate_kes_per_m3": float(lot.cost_per_m3) if unit == "m3" else 0.0,
             "inventory_value_kes": float(lot.remaining_m3) * float(lot.cost_per_m3),
+            "sold_quantity": 0.0,
             "sold_m3": 0.0,
             "sales_revenue_kes": 0.0,
             "cost_of_goods_sold_kes": 0.0,
         })
-        species_entry = species_financials.setdefault(lot.species, {
+        species_key = (category, lot.species)
+        species_entry = species_financials.setdefault(species_key, {
+            "category": category,
+            "unit": unit,
             "species": lot.species,
+            "available_quantity": 0.0,
             "available_m3": 0.0,
             "inventory_value_kes": 0.0,
+            "sold_quantity": 0.0,
             "sold_m3": 0.0,
             "sales_revenue_kes": 0.0,
             "cost_of_goods_sold_kes": 0.0,
+            "purchase_quantity": 0.0,
             "purchase_volume_m3": 0.0,
             "purchase_value_kes": 0.0,
         })
-        species_entry["available_m3"] += float(lot.remaining_m3)
+        category_totals[category]["available_quantity"] += remaining
+        if remaining > 0:
+            category_totals[category]["lots"] += 1
+        species_entry["available_quantity"] += remaining
+        species_entry["available_m3"] += remaining if unit == "m3" else 0.0
         species_entry["inventory_value_kes"] += float(lot.remaining_m3) * float(lot.cost_per_m3)
-        species_entry["purchase_volume_m3"] += float(lot.volume_m3)
+        species_entry["purchase_quantity"] += amount
+        species_entry["purchase_volume_m3"] += amount if unit == "m3" else 0.0
         species_entry["purchase_value_kes"] += float(lot.volume_m3) * float(lot.cost_per_m3)
         if lot.remaining_m3 > 0:
-            entry = stock.setdefault(lot.species, {
-                "species": lot.species, "volume_m3": 0.0, "lots": 0,
+            entry = stock.setdefault(species_key, {
+                "category": category, "unit": unit, "species": lot.species,
+                "quantity": 0.0, "volume_m3": 0.0, "lots": 0,
             })
-            entry["volume_m3"] += lot.remaining_m3
+            entry["quantity"] += remaining
+            if unit == "m3":
+                entry["volume_m3"] += remaining
             entry["lots"] += 1
     for sale in sales:
+        category = sale.lot.category if sale.lot.category in LOT_CATEGORIES else "other"
+        unit = unit_for_category(category)
+        quantity = float(sale.volume_m3)
         revenue = float(sale.volume_m3) * float(sale.price_per_m3)
         cost = float(sale.volume_m3) * float(sale.lot.cost_per_m3)
         lot_entry = lot_financials[sale.lot_id]
-        lot_entry["sold_m3"] += float(sale.volume_m3)
+        lot_entry["sold_quantity"] += quantity
+        lot_entry["sold_m3"] += quantity if unit == "m3" else 0.0
         lot_entry["sales_revenue_kes"] += revenue
         lot_entry["cost_of_goods_sold_kes"] += cost
-        species_entry = species_financials[sale.lot.species]
-        species_entry["sold_m3"] += float(sale.volume_m3)
+        species_entry = species_financials[(category, sale.lot.species)]
+        species_entry["sold_quantity"] += quantity
+        species_entry["sold_m3"] += quantity if unit == "m3" else 0.0
         species_entry["sales_revenue_kes"] += revenue
         species_entry["cost_of_goods_sold_kes"] += cost
+        category_totals[category]["sold_quantity"] += quantity
     for entry in species_financials.values():
+        entry["average_purchase_rate"] = (
+            entry["purchase_value_kes"] / entry["purchase_quantity"]
+            if entry["purchase_quantity"] else 0.0
+        )
         entry["average_purchase_rate_kes_per_m3"] = (
-            entry["purchase_value_kes"] / entry["purchase_volume_m3"]
-            if entry["purchase_volume_m3"] else 0.0
+            entry["average_purchase_rate"] if entry["unit"] == "m3" else 0.0
         )
         entry["gross_profit_kes"] = entry["sales_revenue_kes"] - entry["cost_of_goods_sold_kes"]
     for entry in lot_financials.values():
         entry["gross_profit_kes"] = entry["sales_revenue_kes"] - entry["cost_of_goods_sold_kes"]
     result = {
         "summary": {
-            "stock_m3": sum(lot.remaining_m3 for lot in lots),
-            "sold_m3": sum(sale.volume_m3 for sale in sales),
+            "stock_m3": sum(lot.remaining_m3 for lot in lots if lot.category not in PIECE_CATEGORIES),
+            "sold_m3": sum(
+                sale.volume_m3 for sale in sales if sale.lot.category not in PIECE_CATEGORIES
+            ),
+            "stock_by_category": list(category_totals.values()),
             "lots": len(lots),
         },
-        "stock_by_species": sorted(stock.values(), key=lambda entry: entry["species"]),
+        "stock_by_species": sorted(stock.values(), key=lambda entry: (entry["category"], entry["species"])),
     }
     if user.role in {"owner", "finance"}:
         sales_revenue = sum(float(sale.volume_m3) * float(sale.price_per_m3) for sale in sales)
@@ -662,7 +731,7 @@ def reports(user: Annotated[User, Depends(require_permission("reports.read"))], 
                 "cost_of_goods_sold_kes": cost_of_goods_sold,
                 "gross_profit_kes": sales_revenue - cost_of_goods_sold,
             },
-            "by_species": sorted(species_financials.values(), key=lambda entry: entry["species"]),
+            "by_species": sorted(species_financials.values(), key=lambda entry: (entry["category"], entry["species"])),
             "by_lot": sorted(lot_financials.values(), key=lambda entry: entry["lot_code"]),
         }
     return result
@@ -680,16 +749,38 @@ def stock_report(_user: Annotated[User, Depends(require_permission("reports.read
     lots = db.scalars(select(Lot).order_by(Lot.location, Lot.species)).all()
     by_location = {}
     by_species = {}
+    by_category = {}
     for lot in lots:
         if lot.remaining_m3 <= 0:
             continue
-        location = by_location.setdefault(lot.location, {"location": lot.location, "volume_m3": 0.0, "lots": 0})
-        location["volume_m3"] += lot.remaining_m3
+        category = lot.category if lot.category in LOT_CATEGORIES else "other"
+        unit = unit_for_category(category)
+        location_key = (lot.location, category)
+        location = by_location.setdefault(location_key, {
+            "location": lot.location, "category": category, "unit": unit, "quantity": 0.0, "volume_m3": 0.0, "lots": 0,
+        })
+        location["quantity"] += lot.remaining_m3
+        if unit == "m3":
+            location["volume_m3"] += lot.remaining_m3
         location["lots"] += 1
-        species = by_species.setdefault(lot.species, {"species": lot.species, "volume_m3": 0.0, "lots": 0})
-        species["volume_m3"] += lot.remaining_m3
+        species_key = (lot.species, category)
+        species = by_species.setdefault(species_key, {
+            "species": lot.species, "category": category, "unit": unit, "quantity": 0.0, "volume_m3": 0.0, "lots": 0,
+        })
+        species["quantity"] += lot.remaining_m3
+        if unit == "m3":
+            species["volume_m3"] += lot.remaining_m3
         species["lots"] += 1
-    return {"by_location": list(by_location.values()), "by_species": list(by_species.values())}
+        category_row = by_category.setdefault(category, {
+            "category": category, "unit": unit, "quantity": 0.0, "lots": 0,
+        })
+        category_row["quantity"] += lot.remaining_m3
+        category_row["lots"] += 1
+    return {
+        "by_location": list(by_location.values()),
+        "by_species": list(by_species.values()),
+        "by_category": list(by_category.values()),
+    }
 
 
 @app.get("/api/v1/reports/purchases-vs-sales", tags=["reports"])
@@ -703,11 +794,29 @@ def purchases_vs_sales(
             if in_date_range(lot.created_at, start_date, end_date)]
     sales = [sale for sale in db.scalars(select(Sale)).all()
              if in_date_range(sale.created_at, start_date, end_date)]
+    by_category = {}
+    for lot in lots:
+        category = lot.category if lot.category in LOT_CATEGORIES else "other"
+        row = by_category.setdefault(category, {
+            "category": category, "unit": unit_for_category(category),
+            "purchased_quantity": 0.0, "purchase_value_kes": 0.0,
+        })
+        row["purchased_quantity"] += lot.volume_m3
+        row["purchase_value_kes"] += lot.volume_m3 * lot.cost_per_m3
+    for sale in sales:
+        category = sale.lot.category if sale.lot.category in LOT_CATEGORIES else "other"
+        row = by_category.setdefault(category, {
+            "category": category, "unit": unit_for_category(category),
+            "purchased_quantity": 0.0, "purchase_value_kes": 0.0,
+        })
+        row["sold_quantity"] = row.get("sold_quantity", 0.0) + sale.volume_m3
+        row["sales_value_kes"] = row.get("sales_value_kes", 0.0) + sale.volume_m3 * sale.price_per_m3
     return {
-        "purchased_m3": sum(lot.volume_m3 for lot in lots),
-        "sold_m3": sum(sale.volume_m3 for sale in sales),
+        "purchased_m3": sum(lot.volume_m3 for lot in lots if lot.category not in PIECE_CATEGORIES),
+        "sold_m3": sum(sale.volume_m3 for sale in sales if sale.lot.category not in PIECE_CATEGORIES),
         "purchases_kes": sum(lot.volume_m3 * lot.cost_per_m3 for lot in lots),
         "sales_kes": sum(sale.volume_m3 * sale.price_per_m3 for sale in sales),
+        "by_category": list(by_category.values()),
     }
 
 
@@ -718,7 +827,16 @@ def supplier_performance(_user: Annotated[User, Depends(require_permission("repo
         "supplier_id": supplier.id,
         "supplier": supplier.name,
         "lots": len(supplier.lots),
-        "purchased_m3": sum(lot.volume_m3 for lot in supplier.lots),
+        "purchased_m3": sum(lot.volume_m3 for lot in supplier.lots if lot.category not in PIECE_CATEGORIES),
+        "purchased_by_category": [
+            {
+                "category": category,
+                "unit": unit_for_category(category),
+                "quantity": sum(lot.volume_m3 for lot in supplier.lots if lot.category == category),
+            }
+            for category in LOT_CATEGORIES
+            if any(lot.category == category for lot in supplier.lots)
+        ],
         "purchase_value_kes": sum(lot.volume_m3 * lot.cost_per_m3 for lot in supplier.lots),
     } for supplier in suppliers]
 
@@ -736,10 +854,20 @@ def margin_by_species(
     sales = [sale for sale in db.scalars(select(Sale)).all()
              if in_date_range(sale.created_at, start_date, end_date)]
     for sale in sales:
-        entry = rows.setdefault(sale.lot.species, {
-            "species": sale.lot.species, "sold_m3": 0.0, "sales_kes": 0.0, "estimated_cost_kes": 0.0,
+        category = sale.lot.category if sale.lot.category in LOT_CATEGORIES else "other"
+        key = (category, sale.lot.species)
+        entry = rows.setdefault(key, {
+            "category": category,
+            "unit": unit_for_category(category),
+            "species": sale.lot.species,
+            "sold_quantity": 0.0,
+            "sold_m3": 0.0,
+            "sales_kes": 0.0,
+            "estimated_cost_kes": 0.0,
         })
-        entry["sold_m3"] += sale.volume_m3
+        entry["sold_quantity"] += sale.volume_m3
+        if category not in PIECE_CATEGORIES:
+            entry["sold_m3"] += sale.volume_m3
         entry["sales_kes"] += sale.volume_m3 * sale.price_per_m3
         entry["estimated_cost_kes"] += sale.volume_m3 * sale.lot.cost_per_m3
     for entry in rows.values():
@@ -814,7 +942,7 @@ def receive_purchase_order(order_id: int, data: PurchaseOrderReceive,
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Purchase order not found.")
     lot = Lot(
         lot_code=data.lot_code.strip(), supplier_id=order.supplier_id, species=data.species.strip(),
-        grade=data.grade.strip(), volume_m3=data.volume_m3, remaining_m3=data.volume_m3,
+        category=data.category, grade=data.grade.strip(), volume_m3=data.volume_m3, remaining_m3=data.volume_m3,
         cost_per_m3=data.cost_per_m3, location=data.location.strip(),
         origin_document=data.origin_document.strip(), dimensions=data.dimensions,
         pieces=data.pieces, purchase_order_id=order.id, status="in_stock", created_at=timestamp(),
@@ -824,7 +952,7 @@ def receive_purchase_order(order_id: int, data: PurchaseOrderReceive,
     db.add(Movement(lot_id=lot.id, kind="received", detail=f"Received at {lot.location}",
                     volume_m3=lot.volume_m3, user_id=user.id, created_at=timestamp()))
     order.status = "received"
-    audit(db, user, "receive", "lot", lot.id, f"{lot.lot_code}: {lot.volume_m3} m3")
+    audit(db, user, "receive", "lot", lot.id, f"{lot.lot_code}: {lot.volume_m3} {unit_for_category(lot.category)}")
     db.commit()
     return {"id": lot.id, "purchase_order_id": order.id}
 

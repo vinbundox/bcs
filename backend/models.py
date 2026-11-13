@@ -5,6 +5,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.database import Base
 
+LOT_CATEGORIES = ("timber", "poles", "posts", "other")
+PIECE_CATEGORIES = frozenset({"poles", "posts"})
+
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -68,6 +71,7 @@ class Lot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     lot_code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     supplier_id: Mapped[int] = mapped_column(ForeignKey("suppliers.id"), nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False, default="timber")
     species: Mapped[str] = mapped_column(String, nullable=False)
     grade: Mapped[str] = mapped_column(String, nullable=False, default="")
     volume_m3: Mapped[float] = mapped_column(nullable=False)

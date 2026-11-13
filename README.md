@@ -1,6 +1,6 @@
 # TimberTrack
 
-TimberTrack is a mobile-first installable web app with a separate React/Vite frontend and FastAPI backend. It tracks suppliers, purchase orders, timber lots, locations and movements, sales, reporting, team roles and audit history. Backend data is stored in SQLite with SQLAlchemy and versioned by Alembic.
+TimberTrack is a mobile-first installable web app with a separate React/Vite frontend and FastAPI backend. It tracks suppliers, purchase orders, timber lots, locations and movements, sales, reporting, team roles and audit history. Stock is categorized as timber, poles, posts, or others; timber and others use a selectable ft³/m³ display (ft³ by default), while poles and posts are counted in pieces. Backend data is stored in SQLite with SQLAlchemy and versioned by Alembic.
 
 ## Run the full stack with Docker
 
@@ -98,6 +98,6 @@ python -m unittest discover -s tests -v
 
 ## Current scope
 
-This is an early operational MVP, not production-ready financial or tax software. Owners can edit recorded sale/customer details and selling rates; changing sale volume adjusts available stock and every change is recorded in the audit history. Profit/loss reports show estimated gross profit on timber sold (sales less recorded timber cost); operating expenses, taxes, and other overheads are not included. PDF downloads open the browser print dialog; choose **Save as PDF**. Sale PDFs are sales records and do not calculate VAT or other taxes; tax-compliant invoices, payments, document upload, QR/barcode scanning, CSV export and offline data synchronization still need to be added. Reports are operational summaries rather than audited accounts. Volume is tracked in cubic metres and money in Kenyan shillings.
+This is an early operational MVP, not production-ready financial or tax software. Owners can edit recorded sale/customer details and selling rates; changing a sale quantity adjusts available stock and every change is recorded in the audit history. Profit/loss reports show estimated gross profit across categories (sales less recorded purchase cost); operating expenses, taxes, and other overheads are not included. PDF downloads open the browser print dialog; choose **Save as PDF**. Sale PDFs are sales records and do not calculate VAT or other taxes; tax-compliant invoices, payments, document upload, QR/barcode scanning, CSV export and offline data synchronization still need to be added. Reports are operational summaries rather than audited accounts. Existing quantities remain stored in their original base values; cubic-metre stock is converted for display rather than rewritten. Money is tracked in Kenyan shillings.
 
 The app is intended for a small yard and initial evaluation. Before relying on it for business-critical data, arrange monitoring, backups and recovery drills. Use a unique JWT key and HTTPS on any shared deployment.

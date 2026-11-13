@@ -69,6 +69,50 @@ class TimberTrackTests(unittest.TestCase):
         self.assertEqual(self.client.head("/").status_code, 200)
         self.assertEqual(self.client.get("/healthz").status_code, 200)
 
+    def test_piece_categories_keep_stock_and_sales_separate_from_volume(self):
+        self.setup_owner()
+        supplier = self.client.post("/api/v1/suppliers", json={"name": "Forest Supply"}, headers=self.headers())
+        self.assertEqual(supplier.status_code, 201, supplier.text)
+        timber = self.client.post("/api/v1/lots", json={
+            "lot_code": "TIMBER-1", "supplier_id": supplier.json()["id"], "category": "timber",
+            "species": "Cypress", "volume_m3": 2, "cost_per_m3": 1000, "location": "Bay A",
+        }, headers=self.headers())
+        poles = self.client.post("/api/v1/lots", json={
+            "lot_code": "POLES-1", "supplier_id": supplier.json()["id"], "category": "poles",
+            "species": "Eucalyptus", "volume_m3": 12, "cost_per_m3": 45, "location": "Bay B",
+            "pieces": 12,
+        }, headers=self.headers())
+        self.assertEqual(timber.status_code, 201, timber.text)
+        self.assertEqual(poles.status_code, 201, poles.text)
+        fractional_receipt = self.client.post("/api/v1/lots", json={
+            "lot_code": "POLES-FRACTION", "supplier_id": supplier.json()["id"], "category": "posts",
+            "species": "Eucalyptus", "volume_m3": 1.5, "cost_per_m3": 45, "location": "Bay B",
+        }, headers=self.headers())
+        self.assertEqual(fractional_receipt.status_code, 422)
+
+        fractional_sale = self.client.post("/api/v1/sales", json={
+            "lot_id": poles.json()["id"], "customer": "Customer", "volume_m3": 1.5, "price_per_m3": 100,
+        }, headers=self.headers())
+        self.assertEqual(fractional_sale.status_code, 422)
+        sale = self.client.post("/api/v1/sales", json={
+            "lot_id": poles.json()["id"], "customer": "Customer", "volume_m3": 3, "price_per_m3": 100,
+        }, headers=self.headers())
+        self.assertEqual(sale.status_code, 201, sale.text)
+        listed_pole = next(row for row in self.client.get("/api/v1/lots").json() if row["category"] == "poles")
+        self.assertEqual(listed_pole["remaining_quantity"], 9)
+        listed_sale = self.client.get("/api/v1/sales").json()[0]
+        self.assertEqual(listed_sale["category"], "poles")
+        self.assertEqual(listed_sale["unit"], "pcs")
+
+        report = self.client.get("/api/v1/reports").json()
+        self.assertEqual(report["summary"]["stock_m3"], 2)
+        self.assertEqual(report["summary"]["sold_m3"], 0)
+        totals = {row["category"]: row for row in report["summary"]["stock_by_category"]}
+        self.assertEqual(totals["timber"]["available_quantity"], 2)
+        self.assertEqual(totals["poles"]["available_quantity"], 9)
+        self.assertEqual(totals["poles"]["sold_quantity"], 3)
+        self.assertEqual(totals["poles"]["unit"], "pcs")
+
     def test_jwt_auth_stock_traceability_reports_and_rbac(self):
         self.assertEqual(self.client.get("/api/v1/suppliers").status_code, 401)
         self.assertEqual(self.client.post("/api/v1/auth/setup", json={
@@ -242,6 +286,7 @@ class TimberTrackTests(unittest.TestCase):
                 self.assertEqual(connection.exec_driver_sql("SELECT lot_code FROM lots WHERE id=1").scalar(), "LEGACY-1")
                 self.assertIn("dimensions", {column["name"] for column in inspect(connection).get_columns("lots")})
                 self.assertIn("is_active", {column["name"] for column in inspect(connection).get_columns("users")})
+                self.assertEqual(connection.exec_driver_sql("SELECT category FROM lots WHERE id=1").scalar(), "timber")
             engine.dispose()
 
 

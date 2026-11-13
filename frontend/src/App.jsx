@@ -26,8 +26,24 @@ const PAGE_LABELS = {
   users: "Team access",
   audit: "Audit history",
 };
-const formatVolume = (value) =>
-  `${Number(value || 0).toLocaleString("en-KE", { maximumFractionDigits: 3 })} m³`;
+const CUBIC_FEET_PER_CUBIC_METER = 35.3146667;
+const PIECE_CATEGORIES = new Set(["poles", "posts"]);
+const CATEGORY_LABELS = { timber: "Timber", poles: "Poles", posts: "Posts", other: "Others" };
+const formatQuantity = (value, category = "timber", volumeUnit = "ft3") => {
+  const amount = Number(value || 0);
+  if (PIECE_CATEGORIES.has(category)) {
+    return `${amount.toLocaleString("en-KE", { maximumFractionDigits: 0 })} pcs`;
+  }
+  const converted = volumeUnit === "ft3" ? amount * CUBIC_FEET_PER_CUBIC_METER : amount;
+  const unit = volumeUnit === "ft3" ? "ft³" : "m³";
+  return `${converted.toLocaleString("en-KE", { maximumFractionDigits: volumeUnit === "ft3" ? 2 : 3 })} ${unit}`;
+};
+const formatVolume = (value, volumeUnit = "ft3") => formatQuantity(value, "timber", volumeUnit);
+const formatRate = (value, category = "timber", volumeUnit = "ft3") => {
+  const rate = Number(value || 0);
+  if (PIECE_CATEGORIES.has(category)) return `${formatMoney(rate)} / pc`;
+  return `${formatMoney(volumeUnit === "ft3" ? rate / CUBIC_FEET_PER_CUBIC_METER : rate)} / ${volumeUnit === "ft3" ? "ft³" : "m³"}`;
+};
 const formatMoney = (value) =>
   new Intl.NumberFormat("en-KE", { style: "currency", currency: "KES", maximumFractionDigits: 0 }).format(value || 0);
 const formatDate = (value) => (value ? new Date(value).toLocaleString() : "—");
@@ -61,13 +77,16 @@ function openPdfPrintView(title, content) {
   printWindow.document.close();
 }
 
-function downloadReportImage(report) {
+function downloadReportImage(report, volumeUnit = "ft3") {
   const financial = report.financial;
   const species = financial?.by_species || [];
   const lots = financial?.by_lot || [];
   const width = 1400;
   const rowHeight = 42;
-  const height = 550 + (species.length + lots.length) * rowHeight;
+  const categoryCount = report.summary?.stock_by_category?.length || 0;
+  const tableCount = financial ? 4 : 1;
+  const rowCount = categoryCount + (financial ? 1 + species.length + lots.length : 0);
+  const height = 220 + tableCount * 82 + rowCount * rowHeight + 40;
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -82,8 +101,8 @@ function downloadReportImage(report) {
   context.font = "16px Segoe UI, sans-serif";
   context.fillText(`Generated ${new Date().toLocaleString()}`, 48, 88);
   const metrics = [
-    ["Available stock", formatVolume(report.summary?.stock_m3)],
-    ["Volume sold", formatVolume(report.summary?.sold_m3)],
+    ["Available volume", formatVolume(report.summary?.stock_m3, volumeUnit)],
+    ["Volume sold", formatVolume(report.summary?.sold_m3, volumeUnit)],
     ["Lots sourced", String(report.summary?.lots || 0)],
     ...(financial ? [["Available stock value", formatMoney(financial.inventory_value_kes)]] : []),
   ];
@@ -134,28 +153,33 @@ function downloadReportImage(report) {
   };
   if (financial) {
     const pnl = financial.profit_and_loss;
-    drawTable("Overall profit & loss (timber gross profit)", ["Sales revenue", "Timber cost sold", "Estimated gross profit"], [[
+    drawTable("Overall profit & loss (gross profit)", ["Sales revenue", "Cost of goods sold", "Estimated gross profit"], [[
       formatMoney(pnl.sales_revenue_kes),
       formatMoney(pnl.cost_of_goods_sold_kes),
       formatMoney(pnl.gross_profit_kes),
     ]], [420, 420, 416]);
-    drawTable("By species", ["Species", "Available", "Avg. buy / m³", "Stock value", "Sold", "Sales", "Timber cost", "Gross profit"],
+    drawTable("By species", ["Category / species", "Available", "Avg. buy rate", "Stock value", "Sold", "Sales", "Cost of goods", "Gross profit"],
       species.map((row) => [
-        row.species, formatVolume(row.available_m3), formatMoney(row.average_purchase_rate_kes_per_m3),
-        formatMoney(row.inventory_value_kes), formatVolume(row.sold_m3), formatMoney(row.sales_revenue_kes),
+        `${CATEGORY_LABELS[row.category] || row.category} / ${row.species}`,
+        formatQuantity(row.available_quantity, row.category, volumeUnit),
+        formatRate(row.average_purchase_rate, row.category, volumeUnit),
+        formatMoney(row.inventory_value_kes), formatQuantity(row.sold_quantity, row.category, volumeUnit), formatMoney(row.sales_revenue_kes),
         formatMoney(row.cost_of_goods_sold_kes), formatMoney(row.gross_profit_kes),
       ]), [190, 145, 165, 155, 125, 155, 165, 164]);
-    drawTable("By lot / item", ["Lot", "Species", "Available", "Buy rate / m³", "Stock value", "Sold", "Sales", "Gross profit"],
+    drawTable("By lot / item", ["Lot", "Category / species", "Available", "Buy rate", "Stock value", "Sold", "Sales", "Gross profit"],
       lots.map((row) => [
-        row.lot_code, row.species, formatVolume(row.available_m3), formatMoney(row.purchase_rate_kes_per_m3),
-        formatMoney(row.inventory_value_kes), formatVolume(row.sold_m3), formatMoney(row.sales_revenue_kes),
+        row.lot_code, `${CATEGORY_LABELS[row.category] || row.category} / ${row.species}`,
+        formatQuantity(row.available_quantity, row.category, volumeUnit),
+        formatRate(row.purchase_rate, row.category, volumeUnit),
+        formatMoney(row.inventory_value_kes), formatQuantity(row.sold_quantity, row.category, volumeUnit), formatMoney(row.sales_revenue_kes),
         formatMoney(row.gross_profit_kes),
       ]), [150, 170, 150, 170, 160, 130, 170, 164]);
-  } else {
-    drawTable("Stock by species", ["Species", "Open lots", "Available volume"],
-      (report.stock_by_species || []).map((row) => [row.species, row.lots, formatVolume(row.volume_m3)]),
-      [500, 300, 464]);
   }
+  drawTable("Stock by category", ["Category", "Open lots", "Available"],
+    (report.summary?.stock_by_category || []).map((row) => [
+      CATEGORY_LABELS[row.category] || row.category, row.lots,
+      formatQuantity(row.available_quantity, row.category, volumeUnit),
+    ]), [500, 300, 464]);
   const link = document.createElement("a");
   link.download = `timbertrack-report-${new Date().toISOString().slice(0, 10)}.png`;
   link.href = canvas.toDataURL("image/png");
@@ -176,6 +200,9 @@ function App() {
   const [session, setSession] = useState(null);
   const [page, setPage] = useState("overview");
   const [data, setData] = useState({});
+  const [volumeUnit, setVolumeUnit] = useState(() => {
+    try { return window.localStorage.getItem("timbertrack-volume-unit") || "ft3"; } catch { return "ft3"; }
+  });
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState(null);
 
@@ -184,6 +211,10 @@ function App() {
     window.clearTimeout(notify.timeout);
     notify.timeout = window.setTimeout(() => setToast(null), 3200);
   }, []);
+
+  useEffect(() => {
+    try { window.localStorage.setItem("timbertrack-volume-unit", volumeUnit); } catch { /* Storage is optional. */ }
+  }, [volumeUnit]);
 
   const loadSession = useCallback(async () => {
     const result = await request("/api/v1/auth/session");
@@ -249,8 +280,35 @@ function App() {
     const form = event.currentTarget;
     const values = Object.fromEntries(new FormData(form).entries());
     if (endpoint === "/api/v1/lots") {
-      if (!values.pieces) values.pieces = null;
+      const quantity = Number(values.quantity);
+      const rate = Number(values.unit_rate);
+      if (PIECE_CATEGORIES.has(values.category)) {
+        values.volume_m3 = quantity;
+        values.cost_per_m3 = rate;
+        values.pieces = quantity;
+      } else {
+        values.volume_m3 = values.input_unit === "ft3" ? quantity / CUBIC_FEET_PER_CUBIC_METER : quantity;
+        values.cost_per_m3 = values.input_unit === "ft3" ? rate * CUBIC_FEET_PER_CUBIC_METER : rate;
+        values.pieces = values.pieces ? Number(values.pieces) : null;
+      }
       if (!values.dimensions) values.dimensions = null;
+      delete values.quantity;
+      delete values.unit_rate;
+      delete values.input_unit;
+    }
+    if (endpoint === "/api/v1/sales") {
+      const quantity = Number(values.quantity);
+      const rate = Number(values.unit_rate);
+      values.volume_m3 = PIECE_CATEGORIES.has(values.category)
+        ? quantity
+        : values.input_unit === "ft3" ? quantity / CUBIC_FEET_PER_CUBIC_METER : quantity;
+      values.price_per_m3 = PIECE_CATEGORIES.has(values.category)
+        ? rate
+        : values.input_unit === "ft3" ? rate * CUBIC_FEET_PER_CUBIC_METER : rate;
+      delete values.quantity;
+      delete values.unit_rate;
+      delete values.input_unit;
+      delete values.category;
     }
     try {
       await request(endpoint, {
@@ -304,7 +362,15 @@ function App() {
         <section className="main-area">
           <header className="topbar">
             <div><p className="eyebrow">TIMBER OPERATIONS</p><h1>{PAGE_LABELS[page]}</h1></div>
-            <div className="user-area"><span>{session.user.username} · {ROLE_LABELS[session.user.role]}</span><button className="button button-quiet" onClick={signOut}>Sign out</button></div>
+            <div className="user-area">
+              <label className="unit-toggle">Volume
+                <select value={volumeUnit} onChange={(event) => setVolumeUnit(event.target.value)} aria-label="Volume display unit">
+                  <option value="ft3">ft³</option><option value="m3">m³</option>
+                </select>
+              </label>
+              <span>{session.user.username} · {ROLE_LABELS[session.user.role]}</span>
+              <button className="button button-quiet" onClick={signOut}>Sign out</button>
+            </div>
           </header>
           <main className="content">
             <PageContent
@@ -316,6 +382,7 @@ function App() {
               notify={notify}
               submit={submit}
               loadPage={loadPage}
+              volumeUnit={volumeUnit}
             />
           </main>
         </section>
@@ -327,6 +394,7 @@ function App() {
 
 function AuthScreen({ setup, csrf, onSuccess, notify, toast }) {
   const [submitting, setSubmitting] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -350,14 +418,52 @@ function AuthScreen({ setup, csrf, onSuccess, notify, toast }) {
     <>
       <Toast toast={toast} />
       <main className="auth-shell">
-        <form className="auth-card" onSubmit={handleSubmit}>
-          <div className="brand auth-brand"><span className="brand-mark">T</span><span>TimberTrack<small>YARD MANAGEMENT</small></span></div>
-          <h1>{setup ? "Set up your yard" : "Welcome back"}</h1>
-          <p>{setup ? "Create your owner account. Use a strong password of at least 12 characters." : "Sign in to continue to your timber operations."}</p>
-          <div className="field"><label htmlFor="username">Username</label><input id="username" name="username" autoComplete="username" minLength="3" maxLength="80" required /></div>
-          <div className="field"><label htmlFor="password">Password</label><input id="password" name="password" type="password" autoComplete={setup ? "new-password" : "current-password"} minLength={setup ? "12" : "1"} required /></div>
-          <button className="button button-primary" type="submit" disabled={submitting}>{submitting ? "Please wait…" : setup ? "Create owner account" : "Sign in"}</button>
-        </form>
+        <section className="auth-story" aria-label="TimberTrack">
+          <a className="auth-logo" href="/" aria-label="TimberTrack home">
+            <span className="auth-logo-mark" aria-hidden="true">T</span>
+            <span>TimberTrack<small>YARD MANAGEMENT</small></span>
+          </a>
+          <div className="auth-story-copy">
+            <p className="auth-kicker"><span /> FROM SOURCE TO SALE</p>
+            <h2>Know your timber.<br /><span>Own your numbers.</span></h2>
+            <p className="auth-story-text">One clear view of every lot, movement, and sale across your yard.</p>
+            <div className="auth-highlights">
+              <div><span className="auth-highlight-icon" aria-hidden="true">01</span><span><strong>Follow every lot</strong><small>Trace timber from supplier to customer.</small></span></div>
+              <div><span className="auth-highlight-icon" aria-hidden="true">02</span><span><strong>Stay on top of stock</strong><small>See what is available and where it is.</small></span></div>
+              <div><span className="auth-highlight-icon" aria-hidden="true">03</span><span><strong>Make informed decisions</strong><small>Bring purchasing, sales, and reporting together.</small></span></div>
+            </div>
+          </div>
+          <div className="auth-story-foot"><span>BUILT FOR THE WAY YOUR YARD WORKS</span><span>© {new Date().getFullYear()} TIMBERTRACK</span></div>
+          <div className="auth-wood-art" aria-hidden="true"><i /><i /><i /><i /></div>
+        </section>
+        <section className="auth-panel">
+          <div className="auth-mobile-brand">
+            <span className="auth-logo-mark" aria-hidden="true">T</span>
+            <span>TimberTrack<small>YARD MANAGEMENT</small></span>
+          </div>
+          <form className="auth-card" onSubmit={handleSubmit}>
+            <div className="auth-form-eyebrow">{setup ? "GET STARTED" : "YOUR WORKSPACE"}</div>
+            <h1>{setup ? "Set up your yard" : "Welcome back"}</h1>
+            <p className="auth-subtitle">{setup ? "Create your owner account to get your timber operation organized." : "Sign in to pick up where your yard left off."}</p>
+            <div className="field auth-field">
+              <label htmlFor="username">Username</label>
+              <input id="username" name="username" autoComplete="username" minLength="3" maxLength="80" placeholder="Enter your username" required />
+            </div>
+            <div className="field auth-field">
+              <label htmlFor="password">Password</label>
+              <div className="password-input-wrap">
+                <input id="password" name="password" type={showPassword ? "text" : "password"} autoComplete={setup ? "new-password" : "current-password"} minLength={setup ? "12" : "1"} placeholder={setup ? "Create a strong password" : "Enter your password"} required />
+                <button className="password-toggle" type="button" onClick={() => setShowPassword((visible) => !visible)} aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword}>{showPassword ? "Hide" : "Show"}</button>
+              </div>
+              {setup && <span className="auth-field-hint">Use at least 12 characters.</span>}
+            </div>
+            <button className="button button-primary auth-submit" type="submit" disabled={submitting}>
+              {submitting ? <><span className="auth-spinner" aria-hidden="true" /> Please wait…</> : setup ? "Create owner account" : <>Sign in <span aria-hidden="true">→</span></>}
+            </button>
+            <p className="auth-secure-note"><span aria-hidden="true">✓</span> Your workspace is protected with secure sign-in.</p>
+          </form>
+          <div className="auth-panel-foot">Need access? Contact your workspace owner.</div>
+        </section>
       </main>
     </>
   );
@@ -379,19 +485,22 @@ function StatGrid({ children }) {
   return <div className="stats">{children}</div>;
 }
 
-function LotTable({ lots = [], canMove, canEdit = false, onEdit, moveLot, showActions = false, showCosts = false }) {
+function LotTable({ lots = [], canMove, canEdit = false, onEdit, moveLot, showActions = false, showCosts = false, volumeUnit = "ft3" }) {
   if (!lots.length) return <div className="empty">No timber lots yet. Record a receipt to start tracking stock.</div>;
   return (
     <div className="table-wrap">
-      <table><thead><tr><th>Lot</th><th>Species / grade</th><th>Supplier</th><th>Available</th>{showCosts && <><th>Buy rate / m³</th><th>Stock value</th></>}<th>Location</th><th>Status</th>{showActions && <th />}</tr></thead>
+      <table><thead><tr><th>Lot</th><th>Category / species</th><th>Grade</th><th>Supplier</th><th>Available</th>{showCosts && <><th>Buying rate</th><th>Stock value</th></>}<th>Location</th><th>Status</th>{showActions && <th />}</tr></thead>
         <tbody>{lots.map((lot) => {
           const label = lot.lot_status === "reserved" ? "Reserved" : lot.status;
+          const category = lot.category || "timber";
+          const remaining = lot.remaining_quantity ?? lot.remaining_m3;
           return (
             <tr key={lot.id}>
               <td><button className="trace-button" onClick={() => moveLot.history(lot)}>{lot.lot_code}</button></td>
-              <td>{lot.species}{lot.grade ? ` · ${lot.grade}` : ""}{lot.dimensions ? ` · ${lot.dimensions}` : ""}</td>
-              <td>{lot.supplier_name}</td><td>{formatVolume(lot.remaining_m3)}</td>
-              {showCosts && <><td>{formatMoney(lot.cost_per_m3)}</td><td>{formatMoney(Number(lot.remaining_m3) * Number(lot.cost_per_m3 || 0))}</td></>}
+              <td>{CATEGORY_LABELS[category]} · {lot.species}{lot.dimensions ? ` · ${lot.dimensions}` : ""}</td>
+              <td>{lot.grade || "—"}</td>
+              <td>{lot.supplier_name}</td><td>{formatQuantity(remaining, category, volumeUnit)}</td>
+              {showCosts && <><td>{formatRate(lot.buying_rate ?? lot.cost_per_m3, category, volumeUnit)}</td><td>{formatMoney(Number(remaining) * Number(lot.buying_rate ?? lot.cost_per_m3 ?? 0))}</td></>}
               <td>{lot.location}</td>
               <td><span className={`pill${label === "Sold" ? " sold" : label === "Partially sold" ? " warn" : ""}`}>{label}</span></td>
               {showActions && <td className="row-actions">
@@ -406,20 +515,25 @@ function LotTable({ lots = [], canMove, canEdit = false, onEdit, moveLot, showAc
   );
 }
 
-function LotForm({ suppliers, submit }) {
+function LotForm({ suppliers, submit, volumeUnit = "ft3" }) {
+  const [category, setCategory] = useState("timber");
+  const pieces = PIECE_CATEGORIES.has(category);
   return (
     <form className="card" onSubmit={(event) => submit(event, "/api/v1/lots", "Timber receipt recorded.", "sourcing")}>
-      <div className="card-head"><div><h3>Receive timber</h3><p>Register source, grade, volume and yard location.</p></div></div>
+      <div className="card-head"><div><h3>Receive stock</h3><p>Register a purchase by timber category.</p></div></div>
       {!suppliers.length && <p className="warning">Add a supplier before recording a timber receipt.</p>}
       <div className="form-grid">
         <Field label="Lot code"><input name="lot_code" placeholder="e.g. LOT-2026-001" required /></Field>
         <Field label="Supplier" full><select name="supplier_id" required disabled={!suppliers.length}><option value="">Select a supplier</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></Field>
+        <Field label="Category"><select name="category" value={category} onChange={(event) => setCategory(event.target.value)}><option value="timber">Timber</option><option value="poles">Poles</option><option value="posts">Posts</option><option value="other">Others</option></select></Field>
         <Field label="Species"><input name="species" placeholder="e.g. Cypress" required /></Field>
         <Field label="Grade"><input name="grade" placeholder="e.g. C24" /></Field>
         <Field label="Dimensions"><input name="dimensions" placeholder="e.g. 50 × 100 mm" /></Field>
-        <Field label="Pieces"><input name="pieces" type="number" min="1" step="1" /></Field>
-        <Field label="Volume (m³)"><input name="volume_m3" type="number" min="0.001" step="0.001" required /></Field>
-        <Field label="Cost per m³ (KES)"><input name="cost_per_m3" type="number" min="0" step="0.01" required /></Field>
+        {pieces && <><Field label="Quantity (pcs)"><input name="quantity" type="number" min="1" step="1" required /></Field>
+          <input type="hidden" name="input_unit" value="pcs" /><Field label="Buying price per piece (KES)"><input name="unit_rate" type="number" min="0" step="0.01" required /></Field></>}
+        {!pieces && <><Field label={`Volume (${volumeUnit === "ft3" ? "ft³" : "m³"})`}><input name="quantity" type="number" min="0.001" step="0.001" required /></Field>
+          <input type="hidden" name="input_unit" value={volumeUnit} /><Field label={`Buying price per ${volumeUnit === "ft3" ? "ft³" : "m³"} (KES)`}><input name="unit_rate" type="number" min="0" step="0.01" required /></Field>
+          <Field label="Pieces in lot"><input name="pieces" type="number" min="1" step="1" /></Field></>}
         <Field label="Yard location" full><input name="location" placeholder="e.g. Bay A / Stack 04" required /></Field>
         <Field label="Origin document reference" full><input name="origin_document" placeholder="Permit or certificate reference" /></Field>
       </div>
@@ -428,11 +542,38 @@ function LotForm({ suppliers, submit }) {
   );
 }
 
+function SaleForm({ lots, submit, volumeUnit = "ft3" }) {
+  const [lotId, setLotId] = useState("");
+  const selectedLot = lots.find((lot) => String(lot.id) === lotId);
+  const category = selectedLot?.category || "timber";
+  const pieces = PIECE_CATEGORIES.has(category);
+  return (
+    <form className="card" onSubmit={(event) => submit(event, "/api/v1/sales", "Sale recorded and stock updated.", "sales")}>
+      <div className="card-head"><div><h3>Record a sale</h3><p>Stock is deducted from the selected lot.</p></div></div>
+      {!lots.length && <p className="warning">No available stock to sell. Record a receipt first.</p>}
+      <div className="form-grid">
+        <Field label="Customer" full><input name="customer" required /></Field>
+        <Field label="Available lot" full><select name="lot_id" value={lotId} onChange={(event) => setLotId(event.target.value)} required disabled={!lots.length}>
+          <option value="">Select a lot</option>{lots.map((lot) => {
+            const lotCategory = lot.category || "timber";
+            return <option key={lot.id} value={lot.id}>{lot.lot_code} · {CATEGORY_LABELS[lotCategory]} · {lot.species} ({formatQuantity(lot.remaining_quantity ?? lot.remaining_m3, lotCategory, volumeUnit)} available)</option>;
+          })}</select></Field>
+        <input type="hidden" name="category" value={category} />
+        {pieces ? <><Field label="Quantity (pcs)"><input name="quantity" type="number" min="1" step="1" required disabled={!selectedLot} /></Field>
+          <input type="hidden" name="input_unit" value="pcs" /><Field label="Selling price per piece (KES)"><input name="unit_rate" type="number" min="0" step="0.01" required disabled={!selectedLot} /></Field></>
+          : <><Field label={`Quantity (${volumeUnit === "ft3" ? "ft³" : "m³"})`}><input name="quantity" type="number" min="0.001" step="0.001" required disabled={!selectedLot} /></Field>
+            <input type="hidden" name="input_unit" value={volumeUnit} /><Field label={`Selling price per ${volumeUnit === "ft3" ? "ft³" : "m³"} (KES)`}><input name="unit_rate" type="number" min="0" step="0.01" required disabled={!selectedLot} /></Field></>}
+      </div>
+      <div className="form-actions"><button className="button button-primary" disabled={!lots.length}>Record dispatch</button></div>
+    </form>
+  );
+}
+
 function Field({ label, full = false, children }) {
   return <div className={`field${full ? " full" : ""}`}><label>{label}</label>{children}</div>;
 }
 
-function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) {
+function PageContent({ page, data, user, csrf, can, notify, submit, loadPage, volumeUnit }) {
   const [editingLot, setEditingLot] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
   const savePurchaseEdit = async (event) => {
@@ -440,8 +581,22 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     const form = event.currentTarget;
     const values = Object.fromEntries(new FormData(form).entries());
     values.supplier_id = Number(values.supplier_id);
-    values.pieces = values.pieces ? Number(values.pieces) : null;
+    const category = editingLot.category || "timber";
+    const quantity = Number(values.quantity);
+    const rate = Number(values.unit_rate);
+    if (PIECE_CATEGORIES.has(category)) {
+      values.volume_m3 = quantity;
+      values.cost_per_m3 = rate;
+      values.pieces = quantity;
+    } else {
+      values.cost_per_m3 = values.input_unit === "ft3" ? rate * CUBIC_FEET_PER_CUBIC_METER : rate;
+      values.pieces = values.pieces ? Number(values.pieces) : null;
+    }
+    values.category = category;
     values.dimensions = values.dimensions.trim() || null;
+    delete values.quantity;
+    delete values.unit_rate;
+    delete values.input_unit;
     try {
       await request(`/api/v1/lots/${editingLot.id}/purchase`, {
         method: "PUT", csrf, body: JSON.stringify(values),
@@ -455,8 +610,16 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     event.preventDefault();
     const form = event.currentTarget;
     const values = Object.fromEntries(new FormData(form).entries());
-    values.volume_m3 = Number(values.volume_m3);
-    values.price_per_m3 = Number(values.price_per_m3);
+    const category = editingSale.category || "timber";
+    const quantity = Number(values.quantity);
+    const rate = Number(values.unit_rate);
+    values.volume_m3 = PIECE_CATEGORIES.has(category) ? quantity
+      : values.input_unit === "ft3" ? quantity / CUBIC_FEET_PER_CUBIC_METER : quantity;
+    values.price_per_m3 = PIECE_CATEGORIES.has(category) ? rate
+      : values.input_unit === "ft3" ? rate * CUBIC_FEET_PER_CUBIC_METER : rate;
+    delete values.quantity;
+    delete values.unit_rate;
+    delete values.input_unit;
     try {
       await request(`/api/v1/sales/${editingSale.id}`, {
         method: "PUT", csrf, body: JSON.stringify(values),
@@ -490,15 +653,19 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     return <>
       <Intro title={`Good day, ${user.username}`} text="A quick look at your timber yard." action={<button className="button button-primary" onClick={() => loadPage("sourcing")}>+ Receive timber</button>} />
       <StatGrid>
-        <Stat title="Available stock" value={formatVolume(summary.stock_m3)} note="Across all active lots" />
+        <Stat title="Available volume" value={formatVolume(summary.stock_m3, volumeUnit)} note="Timber and other volume stock" />
         <Stat title="Total lots" value={summary.lots || 0} note="Recorded in the yard" />
-        <Stat title="Sold to date" value={formatVolume(summary.sold_m3)} note="Volume dispatched" />
+        <Stat title="Volume sold" value={formatVolume(summary.sold_m3, volumeUnit)} note="Timber and other volume sales" />
         <Stat title={report.financial ? "Sales value" : "Workspace"} value={report.financial ? formatMoney(report.financial.sales_kes) : "Active"} note={report.financial ? "Recorded sales" : "Role-based access"} />
       </StatGrid>
+      <StatGrid>{(summary.stock_by_category || []).map((item) => <Stat key={item.category}
+        title={`${CATEGORY_LABELS[item.category] || item.category} available`}
+        value={formatQuantity(item.available_quantity, item.category, volumeUnit)}
+        note={`${item.lots} active lots`} />)}</StatGrid>
       <div className="grid-two">
-        <section className="card"><div className="card-head"><div><h3>Recent timber lots</h3><p>Latest receipts and current status</p></div><button className="button button-quiet button-small" onClick={() => loadPage("inventory")}>View stock</button></div><LotTable lots={(data.lots || []).slice(0, 6)} moveLot={moveLot} /></section>
-        <section className="card"><div className="card-head"><div><h3>Stock by species</h3><p>Available volume in cubic metres</p></div></div>
-          {report.stock_by_species?.length ? report.stock_by_species.map((row) => <div className="stock-row" key={row.species}><span>{row.species} <span className="muted">({row.lots} lots)</span></span><strong>{formatVolume(row.volume_m3)}</strong></div>) : <div className="empty">Species stock will appear here.</div>}
+        <section className="card"><div className="card-head"><div><h3>Recent timber lots</h3><p>Latest receipts and current status</p></div><button className="button button-quiet button-small" onClick={() => loadPage("inventory")}>View stock</button></div><LotTable lots={(data.lots || []).slice(0, 6)} moveLot={moveLot} volumeUnit={volumeUnit} /></section>
+        <section className="card"><div className="card-head"><div><h3>Stock by category & species</h3><p>Categories remain separated by unit</p></div></div>
+          {report.stock_by_species?.length ? report.stock_by_species.map((row) => <div className="stock-row" key={`${row.category}-${row.species}`}><span>{CATEGORY_LABELS[row.category] || row.category} · {row.species} <span className="muted">({row.lots} lots)</span></span><strong>{formatQuantity(row.quantity, row.category, volumeUnit)}</strong></div>) : <div className="empty">Species stock will appear here.</div>}
         </section>
       </div>
     </>;
@@ -509,14 +676,14 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     return <>
       <Intro title="Source & receive" text="Capture suppliers, purchases, and traceable timber lots." />
       <div className="split">
-        <section className="card"><div className="card-head"><div><h3>Recent receipts</h3><p>Each receipt creates a traceable stock lot.</p></div></div><LotTable lots={(data.lots || []).slice(0, 12)} moveLot={moveLot} /></section>
+        <section className="card"><div className="card-head"><div><h3>Recent receipts</h3><p>Each receipt creates a traceable stock lot.</p></div></div><LotTable lots={(data.lots || []).slice(0, 12)} moveLot={moveLot} volumeUnit={volumeUnit} /></section>
         <div>
           <form className="card" onSubmit={(event) => submit(event, "/api/v1/suppliers", "Supplier saved.", "sourcing")}>
             <div className="card-head"><div><h3>Add supplier</h3><p>Keep source contacts in one place.</p></div></div>
             <div className="form-grid"><Field label="Supplier name" full><input name="name" required /></Field><Field label="Phone" full><input name="phone" type="tel" /></Field></div>
             <div className="form-actions"><button className="button button-primary">Save supplier</button></div>
           </form>
-          <LotForm suppliers={suppliers} submit={submit} />
+          <LotForm suppliers={suppliers} submit={submit} volumeUnit={volumeUnit} />
         </div>
       </div>
     </>;
@@ -526,18 +693,22 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     const lots = data.lots || [];
     const suppliers = data.suppliers || [];
     const inventoryValue = lots.reduce((sum, lot) => sum + Number(lot.remaining_m3) * Number(lot.cost_per_m3 || 0), 0);
-    const inventoryVolume = lots.reduce((sum, lot) => sum + Number(lot.remaining_m3), 0);
+    const categoryTotals = Object.fromEntries(["timber", "poles", "posts", "other"].map((category) => [
+      category,
+      lots.filter((lot) => (lot.category || "timber") === category)
+        .reduce((sum, lot) => sum + Number(lot.remaining_quantity ?? lot.remaining_m3), 0),
+    ]));
     const downloadInventoryPdf = () => {
       const showCosts = can("costs.read");
-      const columns = ["Lot", "Species / grade", "Supplier", "Available volume", ...(showCosts ? ["Buying rate / m³", "Stock value"] : []), "Location", "Status"];
+      const columns = ["Lot", "Category / species / grade", "Supplier", "Available", ...(showCosts ? ["Buying rate", "Stock value"] : []), "Location", "Status"];
       const rows = lots.map((lot) => `<tr><td>${escapeHtml(lot.lot_code)}</td>
-        <td>${escapeHtml([lot.species, lot.grade, lot.dimensions].filter(Boolean).join(" · "))}</td>
-        <td>${escapeHtml(lot.supplier_name)}</td><td>${escapeHtml(formatVolume(lot.remaining_m3))}</td>
-        ${showCosts ? `<td>${escapeHtml(formatMoney(lot.cost_per_m3))}</td><td>${escapeHtml(formatMoney(Number(lot.remaining_m3) * Number(lot.cost_per_m3 || 0)))}</td>` : ""}
+        <td>${escapeHtml([CATEGORY_LABELS[lot.category || "timber"], lot.species, lot.grade, lot.dimensions].filter(Boolean).join(" · "))}</td>
+        <td>${escapeHtml(lot.supplier_name)}</td><td>${escapeHtml(formatQuantity(lot.remaining_quantity ?? lot.remaining_m3, lot.category, volumeUnit))}</td>
+        ${showCosts ? `<td>${escapeHtml(formatRate(lot.buying_rate ?? lot.cost_per_m3, lot.category, volumeUnit))}</td><td>${escapeHtml(formatMoney(Number(lot.remaining_m3) * Number(lot.cost_per_m3 || 0)))}</td>` : ""}
         <td>${escapeHtml(lot.location)}</td><td>${escapeHtml(lot.lot_status === "reserved" ? "Reserved" : lot.status)}</td></tr>`).join("");
       const valueNote = showCosts ? ` · Available stock value: ${escapeHtml(formatMoney(inventoryValue))}` : "";
       const content = `<h1>TimberTrack inventory</h1>
-        <p class="meta">Available volume: ${escapeHtml(formatVolume(inventoryVolume))}${valueNote} · ${lots.length} lots</p>
+        <p class="meta">Available: Timber ${escapeHtml(formatQuantity(categoryTotals.timber, "timber", volumeUnit))} · Poles ${escapeHtml(formatQuantity(categoryTotals.poles, "poles", volumeUnit))} · Posts ${escapeHtml(formatQuantity(categoryTotals.posts, "posts", volumeUnit))} · Others ${escapeHtml(formatQuantity(categoryTotals.other, "other", volumeUnit))}${valueNote} · ${lots.length} lots</p>
         <table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead>
         <tbody>${rows || `<tr><td colspan="${columns.length}">No timber lots recorded.</td></tr>`}</tbody></table>`;
       openPdfPrintView("TimberTrack inventory", content);
@@ -546,7 +717,7 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
       <Intro title="Yard inventory" text="Track availability, location, and movement for every lot." action={<div className="report-actions"><button className="button button-quiet" onClick={() => {
         try { downloadInventoryPdf(); } catch (error) { notify(error.message, true); }
       }}>Download PDF</button><button className="button button-primary" onClick={() => loadPage("sourcing")}>+ Receive timber</button></div>} />
-      <StatGrid><Stat title="Available volume" value={formatVolume(lots.reduce((sum, lot) => sum + Number(lot.remaining_m3), 0))} note="Across all lots" />{can("costs.read") && <Stat title="Available stock value" value={formatMoney(inventoryValue)} note="At recorded timber buying rates" />}<Stat title="Active lots" value={lots.filter((lot) => Number(lot.remaining_m3) > 0).length} note="With stock available" /></StatGrid>
+      <StatGrid>{Object.entries(categoryTotals).map(([category, quantity]) => <Stat key={category} title={`${CATEGORY_LABELS[category]} available`} value={formatQuantity(quantity, category, volumeUnit)} note="Current yard balance" />)}{can("costs.read") && <Stat title="Available stock value" value={formatMoney(inventoryValue)} note="At recorded buying rates" />}<Stat title="Active lots" value={lots.filter((lot) => Number(lot.remaining_m3) > 0).length} note="With stock available" /></StatGrid>
       {editingLot && <form className="card" onSubmit={savePurchaseEdit}>
         <div className="card-head"><div><h3>Edit purchase · {editingLot.lot_code}</h3><p>Received volume cannot be changed here. Cost and source corrections are audited.</p></div>
           <button type="button" className="button button-quiet" onClick={() => setEditingLot(null)}>Cancel</button></div>
@@ -556,14 +727,17 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
           <Field label="Species"><input name="species" defaultValue={editingLot.species} required /></Field>
           <Field label="Grade"><input name="grade" defaultValue={editingLot.grade || ""} /></Field>
           <Field label="Dimensions"><input name="dimensions" defaultValue={editingLot.dimensions || ""} /></Field>
-          <Field label="Pieces"><input name="pieces" type="number" min="1" step="1" defaultValue={editingLot.pieces || ""} /></Field>
-          <Field label="Cost per m³ (KES)"><input name="cost_per_m3" type="number" min="0" step="0.01" defaultValue={editingLot.cost_per_m3} required /></Field>
+          <input type="hidden" name="category" value={editingLot.category || "timber"} />
+          {PIECE_CATEGORIES.has(editingLot.category) ? <Field label="Buying price per piece (KES)"><input name="unit_rate" type="number" min="0" step="0.01" defaultValue={editingLot.buying_rate ?? editingLot.cost_per_m3} required /></Field>
+            : <Field label={`Buying price per ${volumeUnit === "ft3" ? "ft³" : "m³"} (KES)`}><input name="unit_rate" type="number" min="0" step="0.01" defaultValue={volumeUnit === "ft3" ? Number(editingLot.cost_per_m3) / CUBIC_FEET_PER_CUBIC_METER : editingLot.cost_per_m3} required /></Field>}
+          {PIECE_CATEGORIES.has(editingLot.category) ? <><input type="hidden" name="quantity" value={editingLot.quantity ?? editingLot.volume_m3} /><input type="hidden" name="input_unit" value="pcs" /></>
+            : <><input type="hidden" name="input_unit" value={volumeUnit} /><Field label="Pieces in lot"><input name="pieces" type="number" min="1" step="1" defaultValue={editingLot.pieces || ""} /></Field></>}
           <Field label="Yard location"><input name="location" defaultValue={editingLot.location} required /></Field>
           <Field label="Origin document reference" full><input name="origin_document" defaultValue={editingLot.origin_document || ""} /></Field>
         </div>
         <div className="form-actions"><button className="button button-primary">Save purchase changes</button></div>
       </form>}
-      <section className="card"><div className="card-head"><div><h3>All timber lots</h3><p>Select a lot code for its complete traceability history.</p></div></div><LotTable lots={lots} canMove={can("lots.move")} canEdit={user.role === "owner"} onEdit={setEditingLot} moveLot={moveLot} showActions showCosts={can("costs.read")} /></section>
+      <section className="card"><div className="card-head"><div><h3>All timber lots</h3><p>Select a lot code for its complete traceability history.</p></div></div><LotTable lots={lots} canMove={can("lots.move")} canEdit={user.role === "owner"} onEdit={setEditingLot} moveLot={moveLot} showActions showCosts={can("costs.read")} volumeUnit={volumeUnit} /></section>
     </>;
   }
 
@@ -575,25 +749,34 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
       <div className="split">
         <section className="card"><div className="card-head"><div><h3>Recent sales</h3><p>Latest dispatch records</p></div></div>
           {editingSale && <form className="edit-sale-form" onSubmit={saveSaleEdit}>
-            <div className="card-head"><div><h3>Edit invoice INV-{String(editingSale.id).padStart(6, "0")}</h3><p>If volume changes, the stock balance is adjusted automatically.</p></div>
+            <div className="card-head"><div><h3>Edit invoice INV-{String(editingSale.id).padStart(6, "0")}</h3><p>If quantity changes, the stock balance is adjusted automatically.</p></div>
               <button type="button" className="button button-quiet" onClick={() => setEditingSale(null)}>Cancel</button></div>
             <div className="form-grid">
               <Field label="Customer" full><input name="customer" defaultValue={editingSale.customer} required /></Field>
-              <Field label="Volume (m³)"><input name="volume_m3" type="number" min="0.001" step="0.001" defaultValue={editingSale.volume_m3} required /></Field>
-              <Field label="Price per m³ (KES)"><input name="price_per_m3" type="number" min="0" step="0.01" defaultValue={editingSale.price_per_m3} required /></Field>
+              <input type="hidden" name="input_unit" value={PIECE_CATEGORIES.has(editingSale.category) ? "pcs" : volumeUnit} />
+              <Field label={`Quantity (${PIECE_CATEGORIES.has(editingSale.category) ? "pcs" : volumeUnit === "ft3" ? "ft³" : "m³"})`}>
+                <input name="quantity" type="number" min={PIECE_CATEGORIES.has(editingSale.category) ? "1" : "0.001"} step={PIECE_CATEGORIES.has(editingSale.category) ? "1" : "0.001"}
+                  defaultValue={PIECE_CATEGORIES.has(editingSale.category) ? editingSale.quantity : volumeUnit === "ft3" ? editingSale.quantity * CUBIC_FEET_PER_CUBIC_METER : editingSale.quantity} required /></Field>
+              <Field label={`Selling price per ${PIECE_CATEGORIES.has(editingSale.category) ? "piece" : volumeUnit === "ft3" ? "ft³" : "m³"} (KES)`}>
+                <input name="unit_rate" type="number" min="0" step="0.01" defaultValue={PIECE_CATEGORIES.has(editingSale.category) || volumeUnit === "m3" ? editingSale.unit_price : editingSale.unit_price / CUBIC_FEET_PER_CUBIC_METER} required /></Field>
             </div>
             <div className="form-actions"><button className="button button-primary">Save sale and invoice</button></div>
           </form>}
-          {sales.length ? <DataTable columns={["Date", "Customer", "Lot / species", "Volume", "Price / m³", "Total", "Invoice"]} rows={sales.map((sale) => [
-            formatDate(sale.created_at), sale.customer, `${sale.lot_code} · ${sale.species}`, formatVolume(sale.volume_m3),
-            formatMoney(sale.price_per_m3), formatMoney(Number(sale.volume_m3) * Number(sale.price_per_m3)),
+          {sales.length ? <DataTable columns={["Date", "Customer", "Lot / category", "Quantity", "Unit price", "Total", "Invoice"]} rows={sales.map((sale) => [
+            formatDate(sale.created_at), sale.customer, `${sale.lot_code} · ${CATEGORY_LABELS[sale.category] || sale.category} · ${sale.species}`,
+            formatQuantity(sale.quantity ?? sale.volume_m3, sale.category, volumeUnit),
+            formatRate(sale.unit_price ?? sale.price_per_m3, sale.category, volumeUnit),
+            formatMoney(Number(sale.quantity ?? sale.volume_m3) * Number(sale.unit_price ?? sale.price_per_m3)),
             <span className="row-actions">{user.role === "owner" && <button className="button button-quiet button-small" onClick={() => setEditingSale(sale)}>Edit</button>}<button className="button button-quiet button-small" onClick={() => {
-              const amount = Number(sale.volume_m3) * Number(sale.price_per_m3);
+              const quantity = Number(sale.quantity ?? sale.volume_m3);
+              const unitPrice = Number(sale.unit_price ?? sale.price_per_m3);
+              const amount = quantity * unitPrice;
+              const category = sale.category || "timber";
               const content = `<h1>Sales invoice</h1><p class="meta">Invoice reference: INV-${String(sale.id).padStart(6, "0")}<br>
                 Date: ${escapeHtml(formatDate(sale.created_at))}<br>Customer: ${escapeHtml(sale.customer)}</p>
-                <table><thead><tr><th>Lot</th><th>Species</th><th>Description</th><th>Volume</th><th>Rate / m³</th><th>Amount</th></tr></thead>
-                <tbody><tr><td>${escapeHtml(sale.lot_code)}</td><td>${escapeHtml(sale.species)}</td><td>Timber sale</td>
-                <td>${escapeHtml(formatVolume(sale.volume_m3))}</td><td>${escapeHtml(formatMoney(sale.price_per_m3))}</td>
+                <table><thead><tr><th>Lot</th><th>Category / species</th><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead>
+                <tbody><tr><td>${escapeHtml(sale.lot_code)}</td><td>${escapeHtml(`${CATEGORY_LABELS[category]} · ${sale.species}`)}</td><td>${escapeHtml(`${CATEGORY_LABELS[category]} sale`)}</td>
+                <td>${escapeHtml(formatQuantity(quantity, category, volumeUnit))}</td><td>${escapeHtml(formatRate(unitPrice, category, volumeUnit))}</td>
                 <td>${escapeHtml(formatMoney(amount))}</td></tr></tbody>
                 <tfoot><tr><td colspan="5">Total</td><td>${escapeHtml(formatMoney(amount))}</td></tr></tfoot></table>
                 <p class="note">This sales record does not calculate VAT or other taxes.</p>`;
@@ -601,17 +784,7 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
             }}>Invoice PDF</button></span>,
           ])} /> : <div className="empty">No sales recorded yet.</div>}
         </section>
-        {can("sales.write") && <form className="card" onSubmit={(event) => submit(event, "/api/v1/sales", "Sale recorded and stock updated.", "sales")}>
-          <div className="card-head"><div><h3>Record a sale</h3><p>Volume is deducted from the selected lot.</p></div></div>
-          {!lots.length && <p className="warning">No available timber to sell. Record a receipt first.</p>}
-          <div className="form-grid">
-            <Field label="Customer" full><input name="customer" required /></Field>
-            <Field label="Available lot" full><select name="lot_id" required disabled={!lots.length}><option value="">Select a lot</option>{lots.map((lot) => <option key={lot.id} value={lot.id}>{lot.lot_code} · {lot.species} ({formatVolume(lot.remaining_m3)} available)</option>)}</select></Field>
-            <Field label="Volume (m³)"><input name="volume_m3" type="number" min="0.001" step="0.001" required /></Field>
-            <Field label="Price per m³ (KES)"><input name="price_per_m3" type="number" min="0" step="0.01" required /></Field>
-          </div>
-          <div className="form-actions"><button className="button button-primary" disabled={!lots.length}>Record dispatch</button></div>
-        </form>}
+        {can("sales.write") && <SaleForm lots={lots} submit={submit} volumeUnit={volumeUnit} />}
       </div>
     </>;
   }
@@ -623,37 +796,43 @@ function PageContent({ page, data, user, csrf, can, notify, submit, loadPage }) 
     return <>
       <div id="report-print-area">
       <Intro title="Reports" text="Stock value uses recorded purchase rates. Profit is estimated from timber cost only; operating expenses are not included." action={<div className="report-actions no-print"><button className="button button-quiet" onClick={() => {
-        try { downloadReportImage(report); } catch (error) { notify(error.message, true); }
+        try { downloadReportImage(report, volumeUnit); } catch (error) { notify(error.message, true); }
       }}>Download image</button><button className="button button-primary" onClick={() => window.print()}>Download PDF</button></div>} />
       <StatGrid>
-        <Stat title="Available stock" value={formatVolume(report.summary.stock_m3)} note="Current balance" />
-        <Stat title="Volume sold" value={formatVolume(report.summary.sold_m3)} note="Recorded dispatches" />
+        <Stat title="Available volume" value={formatVolume(report.summary.stock_m3, volumeUnit)} note="Timber and other volume stock" />
+        <Stat title="Volume sold" value={formatVolume(report.summary.sold_m3, volumeUnit)} note="Timber and other volume sales" />
         <Stat title="Lots sourced" value={report.summary.lots || 0} note="All-time receipts" />
         <Stat title={financial ? "Available stock value" : "Financial data"} value={financial ? formatMoney(financial.inventory_value_kes) : "Restricted"} note={financial ? "At recorded purchase rates" : "Ask an owner for access"} />
       </StatGrid>
+      <StatGrid>{(report.summary.stock_by_category || []).map((item) => <Stat key={item.category}
+        title={`${CATEGORY_LABELS[item.category] || item.category} available`}
+        value={formatQuantity(item.available_quantity, item.category, volumeUnit)}
+        note={`${item.lots} active lots`} />)}</StatGrid>
       {financial && <section className="card">
-        <div className="card-head"><div><h3>Overall profit & loss</h3><p>Estimated gross result from sold timber; operating expenses are not tracked here.</p></div></div>
+        <div className="card-head"><div><h3>Overall profit & loss</h3><p>Estimated gross result across categories; operating expenses are not tracked here.</p></div></div>
         <DataTable columns={["Sales revenue", "Cost of timber sold", "Estimated gross profit / (loss)"]} rows={[[
           formatMoney(pnl.sales_revenue_kes), formatMoney(pnl.cost_of_goods_sold_kes), formatMoney(pnl.gross_profit_kes),
         ]]} />
       </section>}
       {financial && <section className="card">
-        <div className="card-head"><div><h3>Profit & loss and available stock by species</h3><p>Weighted-average purchase rate; stock values use current quantities and recorded buying costs.</p></div></div>
-        {financial.by_species.length ? <DataTable columns={["Species", "Available", "Avg. buy rate / m³", "Stock value", "Sold", "Sales", "Timber cost", "Gross profit / (loss)"]} rows={financial.by_species.map((row) => [
-          row.species, formatVolume(row.available_m3), formatMoney(row.average_purchase_rate_kes_per_m3),
-          formatMoney(row.inventory_value_kes), formatVolume(row.sold_m3), formatMoney(row.sales_revenue_kes),
+        <div className="card-head"><div><h3>Profit & loss and available stock by category / species</h3><p>Rates use each category's unit; stock values use current quantities and recorded buying costs.</p></div></div>
+        {financial.by_species.length ? <DataTable columns={["Category / species", "Available", "Avg. buy rate", "Stock value", "Sold", "Sales", "Cost of goods", "Gross profit / (loss)"]} rows={financial.by_species.map((row) => [
+          `${CATEGORY_LABELS[row.category] || row.category} · ${row.species}`,
+          formatQuantity(row.available_quantity, row.category, volumeUnit), formatRate(row.average_purchase_rate, row.category, volumeUnit),
+          formatMoney(row.inventory_value_kes), formatQuantity(row.sold_quantity, row.category, volumeUnit), formatMoney(row.sales_revenue_kes),
           formatMoney(row.cost_of_goods_sold_kes), formatMoney(row.gross_profit_kes),
         ])} /> : <div className="empty">No species data to report yet.</div>}
       </section>}
       {financial && <section className="card">
-        <div className="card-head"><div><h3>Profit & loss and stock by lot / item</h3><p>Available volume, buying rate, stock value, and estimated result for every traceable lot.</p></div></div>
-        {financial.by_lot.length ? <DataTable columns={["Lot", "Species", "Available", "Buy rate / m³", "Stock value", "Sold", "Sales", "Timber cost", "Gross profit / (loss)"]} rows={financial.by_lot.map((row) => [
-          row.lot_code, row.species, formatVolume(row.available_m3), formatMoney(row.purchase_rate_kes_per_m3),
-          formatMoney(row.inventory_value_kes), formatVolume(row.sold_m3), formatMoney(row.sales_revenue_kes),
+        <div className="card-head"><div><h3>Profit & loss and stock by lot / item</h3><p>Available quantity, buying rate, stock value, and estimated result for every traceable lot.</p></div></div>
+        {financial.by_lot.length ? <DataTable columns={["Lot", "Category / species", "Available", "Buy rate", "Stock value", "Sold", "Sales", "Cost of goods", "Gross profit / (loss)"]} rows={financial.by_lot.map((row) => [
+          row.lot_code, `${CATEGORY_LABELS[row.category] || row.category} · ${row.species}`,
+          formatQuantity(row.available_quantity, row.category, volumeUnit), formatRate(row.purchase_rate, row.category, volumeUnit),
+          formatMoney(row.inventory_value_kes), formatQuantity(row.sold_quantity, row.category, volumeUnit), formatMoney(row.sales_revenue_kes),
           formatMoney(row.cost_of_goods_sold_kes), formatMoney(row.gross_profit_kes),
         ])} /> : <div className="empty">No lots to report yet.</div>}
       </section>}
-      <section className="card"><div className="card-head"><div><h3>Stock by species</h3><p>Remaining timber volume across all lots</p></div></div>{report.stock_by_species?.length ? <DataTable columns={["Species", "Open lots", "Available volume"]} rows={report.stock_by_species.map((row) => [row.species, row.lots, formatVolume(row.volume_m3)])} /> : <div className="empty">No stock data to report yet.</div>}</section>
+      <section className="card"><div className="card-head"><div><h3>Stock by category & species</h3><p>Quantities stay in their category's unit.</p></div></div>{report.stock_by_species?.length ? <DataTable columns={["Category / species", "Open lots", "Available"]} rows={report.stock_by_species.map((row) => [`${CATEGORY_LABELS[row.category] || row.category} · ${row.species}`, row.lots, formatQuantity(row.quantity, row.category, volumeUnit)])} /> : <div className="empty">No stock data to report yet.</div>}</section>
       </div>
     </>;
   }

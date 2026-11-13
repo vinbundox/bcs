@@ -25,6 +25,11 @@ def upgrade():
         )
 
     lot_columns = {column["name"] for column in inspector.get_columns("lots")}
+    if "category" not in lot_columns:
+        op.add_column(
+            "lots",
+            sa.Column("category", sa.String(), nullable=False, server_default="timber"),
+        )
     if "dimensions" not in lot_columns:
         op.add_column("lots", sa.Column("dimensions", sa.String(), nullable=True))
     if "pieces" not in lot_columns:
